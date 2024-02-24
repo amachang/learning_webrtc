@@ -34,14 +34,19 @@ pub fn convert_ice_candidates(candidates: Vec<mediasoup::data_structures::IceCan
     Ok(result)
 }
 
-pub fn sha256_fingerprint_to_dtls_parameters(fingerprint: [u8; 32]) -> mediasoup::data_structures::DtlsParameters {
+pub fn sha256_fingerprint_to_dtls_parameters(fingerprint: [u8; 32], local_is_client: bool) -> mediasoup::data_structures::DtlsParameters {
+    let role = if local_is_client {
+        mediasoup::data_structures::DtlsRole::Client
+    } else {
+        mediasoup::data_structures::DtlsRole::Server
+    };
     mediasoup::data_structures::DtlsParameters {
         fingerprints: vec![
             mediasoup::data_structures::DtlsFingerprint::Sha256 {
                 value: fingerprint,
             }
         ],
-        role: mediasoup::data_structures::DtlsRole::Server, /* 多分、自分がサーバーであることを示すための値 */
+        role,
     }
 }
 

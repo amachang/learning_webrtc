@@ -28,6 +28,7 @@ mod mediasoup_signaling;
 mod mediasoup_data_converter;
 
 const RECEIVE_MTU: usize = 1460;
+const LOCAL_IS_DTLS_CLIENT: bool = true;
 
 use crate::mediasoup_signaling::Signaling;
 
@@ -63,7 +64,7 @@ async fn main() -> Result<()> {
     log::info!("protection profile: {:?}", protection_rofile);
     let mut srtp_config = webrtc_srtp::config::Config::default();
     srtp_config.profile = protection_rofile;
-    srtp_config.extract_session_keys_from_dtls(dtls_conn_state, false).await?;
+    srtp_config.extract_session_keys_from_dtls(dtls_conn_state, LOCAL_IS_DTLS_CLIENT).await?;
     let srtp_conn = conn.new_endpoint(Box::new(mux_func::match_srtp)).await;
     let srtp_session = Session::new(srtp_conn, srtp_config, true).await?;
 
@@ -81,7 +82,7 @@ async fn main() -> Result<()> {
     };
     let mut srtcp_config = webrtc_srtp::config::Config::default();
     srtcp_config.profile = protection_rofile;
-    srtcp_config.extract_session_keys_from_dtls(dtls_conn_state, false).await?;
+    srtcp_config.extract_session_keys_from_dtls(dtls_conn_state, LOCAL_IS_DTLS_CLIENT).await?;
     let srtcp_conn = conn.new_endpoint(Box::new(mux_func::match_srtcp)).await;
     let srtcp_session = Session::new(srtcp_conn, srtcp_config, false).await?;
 
@@ -262,7 +263,7 @@ async fn upgrade_to_dtls(conn: Arc<impl Conn + Send + Sync + 'static>, signaling
     let local_fingerprint = fingerprint(local_cert.certificate[0].as_ref());
 
     // let server know our fingerprint
-    let local_dtls_parameters = mediasoup_data_converter::sha256_fingerprint_to_dtls_parameters(local_fingerprint);
+    let local_dtls_parameters = mediasoup_data_converter::sha256_fingerprint_to_dtls_parameters(local_fingerprint, LOCAL_IS_DTLS_CLIENT);
     signaling.send_dtls_cert_info(local_dtls_parameters).await?;
 
     // establish dtls connection
@@ -281,7 +282,7 @@ async fn upgrade_to_dtls(conn: Arc<impl Conn + Send + Sync + 'static>, signaling
         ..Default::default()
     };
 
-    let dtls_conn = Arc::new(DTLSConn::new(conn, config, false, None).await?);
+    let dtls_conn = Arc::new(DTLSConn::new(conn, config, LOCAL_IS_DTLS_CLIENT, None).await?);
 
     // validate remote cert
     let remote_certs = &dtls_conn.connection_state().await.peer_certificates;
