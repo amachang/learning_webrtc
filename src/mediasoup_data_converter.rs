@@ -60,8 +60,8 @@ pub fn dtls_parameters_to_sha256_fingerprint(parameters: mediasoup::data_structu
 }
 
 pub fn rtp_parameters_to_sdp(
-    video_rtp_parameters: mediasoup::rtp_parameters::RtpParameters,
-    audio_rtp_parameters: mediasoup::rtp_parameters::RtpParameters,
+    video_rtp_parameters: &mediasoup::rtp_parameters::RtpParameters,
+    audio_rtp_parameters: &mediasoup::rtp_parameters::RtpParameters,
     video_port: u16, audio_port: u16,
 ) -> Result<String> {
     ensure!(video_rtp_parameters.encodings.len() == 1, "only support one encoding");
@@ -98,7 +98,7 @@ pub fn rtp_parameters_to_sdp(
 
     let video_payload_type = match video_codec { mediasoup::rtp_parameters::RtpCodecParameters::Video { payload_type, .. } => *payload_type, _ => bail!("video payload type not found") };
     let rtx_payload_type = match rtx_codec { mediasoup::rtp_parameters::RtpCodecParameters::Video { payload_type, .. } => *payload_type, _ => bail!("rtx payload type not found")};
-    let video_cname = video_rtp_parameters.rtcp.cname.context("cname not found")?;
+    let video_cname = video_rtp_parameters.rtcp.cname.as_ref().context("cname not found")?;
     let rtx_cname = video_cname.clone();
     let video_header_extension = video_rtp_parameters.header_extensions.iter().map(|extension| {
         format!("a=extmap:{} {}\r\n", extension.id, extension.uri.as_str())
@@ -127,7 +127,7 @@ pub fn rtp_parameters_to_sdp(
         _ => None,
     }).next().context("opus codec not found")?;
     let audio_payload_type = match audio_codec { mediasoup::rtp_parameters::RtpCodecParameters::Audio { payload_type, .. } => *payload_type, _ => bail!("audio payload type not found") };
-    let audio_cname = audio_rtp_parameters.rtcp.cname.context("cname not found")?;
+    let audio_cname = audio_rtp_parameters.rtcp.cname.as_ref().context("cname not found")?;
     let audio_header_extension = audio_rtp_parameters.header_extensions.iter().map(|extension| {
         format!("a=extmap:{} {}\r\n", extension.id, extension.uri.as_str())
     }).collect::<String>();

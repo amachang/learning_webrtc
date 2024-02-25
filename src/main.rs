@@ -5,6 +5,7 @@ use webrtc_dtls::{
     crypto::Certificate,
     conn::DTLSConn,
 };
+use webrtc_srtp::session::Session;
 use webrtc::mux::Mux;
 use bytes::Bytes;
 
@@ -18,6 +19,9 @@ const LOCAL_IS_DTLS_CLIENT: bool = match DTLS_ROLE {
 };
 
 use crate::mediasoup_signaling::Signaling;
+
+const VIDEO_PORT: u16 = 4000;
+const AUDIO_PORT: u16 = 5000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -45,6 +49,11 @@ async fn main() -> Result<()> {
     log::info!("video rtp parameters: {:?}", video_rtp_parameters);
     log::info!("audio rtp parameters: {:?}", audio_rtp_parameters);
 
+    let sdp = mediasoup_data_converter::rtp_parameters_to_sdp(&video_rtp_parameters, &audio_rtp_parameters, VIDEO_PORT, AUDIO_PORT)?;
+    log::info!("sdp: {}", sdp);
+    let sdp_path = Path::new("video.sdp");
+    File::create(&sdp_path).await?.write_all(sdp.as_bytes()).await?;
+    
     ensure!(video_rtp_parameters.encodings.len() == 1, "only support one encoding");
     let video_encoding = &video_rtp_parameters.encodings[0];
     let rtx_info = video_encoding.rtx.as_ref().context("rtx info not found")?;
@@ -54,6 +63,18 @@ async fn main() -> Result<()> {
     ensure!(audio_rtp_parameters.encodings.len() == 1, "only support one encoding");
     let audio_encoding = &audio_rtp_parameters.encodings[0];
     let audio_ssrc = audio_encoding.ssrc.context("ssrc not found")?;
+
+    signaling.send_resume().await?;
+
+    let srtp_session = Arc::new(srtp_session);
+    let srtcp_session = Arc::new(srtcp_session);
+    play(signaling, srtp_session, srtcp_session, sdp_path, video_ssrc, rtx_ssrc, audio_ssrc).await?;
+
+    Ok(())
+}
+
+async fn play(mut signaling: Signaling, srtp_session: Arc<Session>, srtcp_session: Arc<Session>, sdp_path: impl AsRef<Path>, video_ssrc: u32, rtx_ssrc: u32, audio_ssrc: u32) -> Result<()> {
+    let sdp_path = sdp_path.as_ref();
 
     let video_rtp_stream = srtp_session.open(video_ssrc).await;
     let video_rtcp_stream = srtcp_session.open(video_ssrc).await;
@@ -66,26 +87,16 @@ async fn main() -> Result<()> {
     let mut buf_audio_rtcp = vec![0u8; 1500];
     let mut buf_send_audio_rtcp = vec![0u8; 1500];
 
-    let video_port = 4000;
-    let audio_port = 5000;
-    
     let video_socket = UdpSocket::bind("127.0.0.1:0").await?;
-    video_socket.connect(format!("127.0.0.1:{}", video_port)).await?;
+    video_socket.connect(format!("127.0.0.1:{}", VIDEO_PORT)).await?;
     let audio_socket = UdpSocket::bind("127.0.0.1:0").await?;
-    audio_socket.connect(format!("127.0.0.1:{}", audio_port)).await?;
-
-    let video_ssrc = video_encoding.ssrc.context("ssrc not found")?;
-    let audio_ssrc = audio_encoding.ssrc.context("ssrc not found")?;
-
-    let sdp = mediasoup_data_converter::rtp_parameters_to_sdp(video_rtp_parameters, audio_rtp_parameters, video_port, audio_port)?;
-    let path = Path::new("video.sdp");
-    File::create(path).await?.write_all(sdp.as_bytes()).await?;
+    audio_socket.connect(format!("127.0.0.1:{}", AUDIO_PORT)).await?;
 
     let mut player_task = tokio::process::Command::new("ffplay")
         .arg("-loglevel").arg("trace")
         .arg("-analyzeduration").arg("2048M").arg("-probesize").arg("2048M")
         .arg("-use_wallclock_as_timestamps").arg("1")
-        .arg("-protocol_whitelist").arg("file,udp,rtp").arg("video.sdp")
+        .arg("-protocol_whitelist").arg("file,udp,rtp").arg(sdp_path)
         .spawn()?;
 
 /*
@@ -94,12 +105,10 @@ async fn main() -> Result<()> {
         .arg("-loglevel").arg("trace")
         .arg("-analyzeduration").arg("2048M").arg("-probesize").arg("2048M")
         .arg("-use_wallclock_as_timestamps").arg("1")
-        .arg("-protocol_whitelist").arg("file,udp,rtp").arg("-i").arg("video.sdp")
+        .arg("-protocol_whitelist").arg("file,udp,rtp").arg("-i").arg(sdp_path)
         .arg("-c").arg("copy")
         .arg("output.mkv").spawn()?;
 */
-
-    log::info!("sdp: {}", sdp);
 
     futures::future::try_join_all(vec![
         video_socket.writable(),
@@ -108,10 +117,8 @@ async fn main() -> Result<()> {
 
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    signaling.send_resume().await?;
     log::info!("sent resume");
 
-    let srtcp_session = Arc::new(srtcp_session);
     let video_srtcp_session = srtcp_session.clone();
     let _video_rtp_task: tokio::task::JoinHandle<Result<()>> = tokio::task::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
@@ -170,8 +177,7 @@ async fn main() -> Result<()> {
     loop {
         log::trace!("loop: {}", i);
         tokio::select! {
-            r = signaling.wait_until_closed() => {
-                r.with_context(|| "signaling closed")?;
+            _ = signaling.wait_until_closed() => {
                 break;
             },
             _ = interval.tick() => {
