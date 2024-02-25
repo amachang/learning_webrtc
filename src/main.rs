@@ -1,18 +1,11 @@
 use std::{sync::Arc, path::Path};
 use anyhow::{Context, Result, ensure, bail};
 use tokio::{fs::File, io::AsyncWriteExt, net::UdpSocket, sync::mpsc};
-use sha2::{Sha256, Digest};
 use webrtc_dtls::{
     crypto::Certificate,
-    config::{
-        ExtendedMasterSecretType,
-        ClientAuthType,
-    },
     conn::DTLSConn,
-    extension::extension_use_srtp::SrtpProtectionProfile,
 };
 use webrtc_srtp::session::Session;
-use webrtc_util::conn::Conn;
 use webrtc::mux::{Mux, mux_func};
 use bytes::Bytes;
 
@@ -20,7 +13,10 @@ mod mediasoup_signaling;
 mod mediasoup_data_converter;
 mod util;
 
-const LOCAL_IS_DTLS_CLIENT: bool = true;
+const DTLS_ROLE: util::DtlsRole = util::DtlsRole::Client;
+const LOCAL_IS_DTLS_CLIENT: bool = match DTLS_ROLE {
+    util::DtlsRole::Client => true,
+};
 
 use crate::mediasoup_signaling::Signaling;
 
@@ -35,8 +31,7 @@ async fn main() -> Result<()> {
 
     log::info!("connected");
 
-    let dtls_conn = conn.new_endpoint(Box::new(mux_func::match_dtls)).await;
-    let dtls_conn = upgrade_to_dtls(dtls_conn, &mut signaling).await?;
+    let dtls_conn = upgrade_to_dtls(&conn, &mut signaling).await?;
 
     log::info!("dtls established");
 
@@ -253,49 +248,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn upgrade_to_dtls(conn: Arc<impl Conn + Send + Sync + 'static>, signaling: &mut Signaling) -> Result<Arc<DTLSConn>> {
-    // config is too common, use the name in local
-    use webrtc_dtls::config::Config;
-
+async fn upgrade_to_dtls(conn: &Mux, signaling: &mut Signaling) -> Result<Arc<DTLSConn>> {
+    // generate local certificate and fingerprint
     let local_cert = Certificate::generate_self_signed(vec!["localhost".to_owned()])?;
     ensure!(local_cert.certificate.len() == 1, "only support one certificate");
-    let local_fingerprint = fingerprint(local_cert.certificate[0].as_ref());
+    let local_fingerprint = util::get_cert_fingerprint(local_cert.certificate[0].as_ref());
 
-    // let server know our fingerprint
+    // send local fingerprint and receive remote fingerprint
     let local_dtls_parameters = mediasoup_data_converter::sha256_fingerprint_to_dtls_parameters(local_fingerprint, LOCAL_IS_DTLS_CLIENT);
     signaling.send_dtls_cert_info(local_dtls_parameters).await?;
-
-    // establish dtls connection
     let remote_dtls_parameters = signaling.dtls_parameters().await?;
     let expected_remote_fingerprint = mediasoup_data_converter::dtls_parameters_to_sha256_fingerprint(remote_dtls_parameters)?;
 
-    let config = Config {
-        certificates: vec![local_cert],
-        insecure_skip_verify: true,
-        extended_master_secret: ExtendedMasterSecretType::Require,
-        srtp_protection_profiles: vec![
-            SrtpProtectionProfile::Srtp_Aead_Aes_128_Gcm,
-            SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80,
-        ],
-        client_auth: ClientAuthType::RequireAnyClientCert,
-        ..Default::default()
-    };
-
-    let dtls_conn = Arc::new(DTLSConn::new(conn, config, LOCAL_IS_DTLS_CLIENT, None).await?);
-
-    // validate remote cert
-    let remote_certs = &dtls_conn.connection_state().await.peer_certificates;
-    ensure!(remote_certs.len() == 1, "only support one certificate");
-    let actual_remote_fingerprint = fingerprint(remote_certs[0].as_ref());
-    ensure!(expected_remote_fingerprint == actual_remote_fingerprint, "remote fingerprint mismatch");
+    let dtls_conn = util::establish_dtls(conn, DTLS_ROLE, local_cert, expected_remote_fingerprint).await?;
 
     Ok(dtls_conn)
-}
-
-fn fingerprint(cert: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(cert);
-    hasher.finalize().into()
 }
 
 async fn connect(signaling: &mut Signaling) -> Result<(Mux, mpsc::Sender<()>)> {
