@@ -62,7 +62,7 @@ pub fn dtls_parameters_to_sha256_fingerprint(parameters: mediasoup::data_structu
 pub fn rtp_parameters_to_sdp(
     video_rtp_parameters: mediasoup::rtp_parameters::RtpParameters,
     audio_rtp_parameters: mediasoup::rtp_parameters::RtpParameters,
-    video_rtp_port: u16, video_rtcp_port: u16, audio_rtp_port: u16, audio_rtcp_port: u16
+    video_port: u16, audio_port: u16,
 ) -> Result<String> {
     ensure!(video_rtp_parameters.encodings.len() == 1, "only support one encoding");
     let video_encoding = &video_rtp_parameters.encodings[0];
@@ -146,11 +146,11 @@ o=- 0 0 IN IP4
 s=-\r\n\
 t=0 0\r\n\
 a=group:BUNDLE video audio\r\n\
-m=video {video_rtp_port} RTP/AVPF {video_payload_type} {rtx_payload_type}\r\n\
+m=video {video_port} RTP/AVPF {video_payload_type} {rtx_payload_type}\r\n\
 c=IN IP4 127.0.0.1\r\n\
 a=mid:video\r\n\
 a=rtpmap:{video_payload_type} VP8/90000\r\n\
-a=rtcp:{video_rtcp_port}\r\n\
+a=rtcp-mux\r\n\
 a=rtcp-rsize\r\n\
 {video_rtcp_feedback}\
 a=rtpmap:{rtx_payload_type} rtx/90000\r\n\
@@ -159,11 +159,11 @@ a=fmtp:{rtx_payload_type} apt={video_payload_type}\r\n\
 a=ssrc-group:FID {video_ssrc} {rtx_ssrc}\r\n\
 a=ssrc:{video_ssrc} cname:{video_cname}\r\n\
 a=ssrc:{rtx_ssrc} cname:{rtx_cname}\r\n\
-m=audio {audio_rtp_port} RTP/AVPF {audio_payload_type}\r\n\
+m=audio {audio_port} RTP/AVPF {audio_payload_type}\r\n\
 c=IN IP4 127.0.0.1\r\n\
 a=mid:audio\r\n\
 a=rtpmap:{audio_payload_type} opus/48000/2\r\n\
-a=rtcp:{audio_rtcp_port}\r\n\
+a=rtcp-mux\r\n\
 a=rtcp-rsize\r\n\
 {audio_rtcp_feedback}\
 {audio_header_extension}\
