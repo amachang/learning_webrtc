@@ -1,13 +1,11 @@
 use std::{sync::Arc, path::Path};
 use anyhow::{Context, Result, ensure};
-use tokio::{fs::File, io::AsyncWriteExt, net::UdpSocket, sync::mpsc};
+use tokio::{fs::File, io::AsyncWriteExt, sync::mpsc};
 use webrtc_dtls::{
     crypto::Certificate,
     conn::DTLSConn,
 };
-use webrtc_srtp::session::Session;
 use webrtc::mux::Mux;
-use bytes::Bytes;
 
 mod mediasoup_signaling;
 mod mediasoup_data_converter;
@@ -69,8 +67,8 @@ async fn main() -> Result<()> {
     let srtp_session = Arc::new(srtp_session);
     let srtcp_session = Arc::new(srtcp_session);
 
-    let video_forward_task = spawn_forward_rtp_task(srtp_session.clone(), srtcp_session.clone(), vec![video_ssrc, rtx_ssrc], VIDEO_PORT);
-    let audio_forward_task = spawn_forward_rtp_task(srtp_session.clone(), srtcp_session.clone(), vec![audio_ssrc], AUDIO_PORT);
+    let video_forward_task = util::spawn_forward_rtp_task(srtp_session.clone(), srtcp_session.clone(), vec![video_ssrc, rtx_ssrc], VIDEO_PORT);
+    let audio_forward_task = util::spawn_forward_rtp_task(srtp_session.clone(), srtcp_session.clone(), vec![audio_ssrc], AUDIO_PORT);
 
 /*
     let mut player_task = tokio::process::Command::new("ffplay")
@@ -109,83 +107,6 @@ async fn main() -> Result<()> {
     let _ = player_task.wait().await;
 
     Ok(())
-}
-
-fn spawn_forward_rtp_task(srtp_session: Arc<Session>, srtcp_session: Arc<Session>, ssrcs: Vec<u32>, port: u16) -> tokio::task::JoinHandle<Result<()>> {
-    tokio::task::spawn(async move {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
-        socket.connect(format!("127.0.0.1:{}", port)).await?;
-
-        let mut tasks = vec![];
-        for ssrc in ssrcs.clone() {
-            {
-                let srtp_session = srtp_session.clone();
-                let socket = socket.clone();
-                let task: tokio::task::JoinHandle<Result<()>> = tokio::task::spawn(async move {
-                    let mut buf = vec![0u8; 1500];
-                    let rtp_stream = srtp_session.open(ssrc).await;
-                    loop {
-                        let n = rtp_stream.read(&mut buf).await?;
-                        match socket.send(&buf[..n]).await {
-                            Ok(_) => (),
-                            Err(e) => log::warn!("failed to forward rtp: {}", e),
-                        }
-                    }
-                });
-                tasks.push(task);
-            };
-            {
-                let srtcp_session = srtcp_session.clone();
-                let socket = socket.clone();
-                let task: tokio::task::JoinHandle<Result<()>> = tokio::task::spawn(async move {
-                    let mut buf = vec![0u8; 1500];
-                    let rtcp_stream = srtcp_session.open(ssrc).await;
-                    loop {
-                        let n = rtcp_stream.read(&mut buf).await?;
-                        match socket.send(&buf[..n]).await {
-                            Ok(_) => (),
-                            Err(e) => log::warn!("failed to forward rtcp: {}", e),
-                        }
-                    }
-                });
-                tasks.push(task);
-            };
-            {
-                let srtcp_session = srtcp_session.clone();
-                let socket = socket.clone();
-                let task: tokio::task::JoinHandle<Result<()>> = tokio::task::spawn(async move {
-                    let mut buf = vec![0u8; 1500];
-                    loop {
-                        let n = match socket.recv(&mut buf).await {
-                            Ok(n) => n,
-                            Err(e) => {
-                                log::warn!("failed to receive rtcp: {}", e);
-                                continue
-                            },
-                        };
-                        let bytes = Bytes::from(buf[..n].to_vec());
-                        srtcp_session.write(&bytes, false).await?;
-                    }
-                });
-                tasks.push(task);
-            };
-            {
-                let srtcp_session = srtcp_session.clone();
-                let task: tokio::task::JoinHandle<Result<()>> = tokio::task::spawn(async move {
-                    loop {
-                        srtcp_session.write_rtcp(&rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication {
-                            sender_ssrc: 0,
-                            media_ssrc: ssrc,
-                        }).await?;
-                    }
-                });
-                tasks.push(task);
-            };
-        }
-
-        futures::future::try_join_all(tasks).await?;
-        Ok(())
-    })
 }
 
 async fn upgrade_to_dtls(conn: &Mux, signaling: &mut Signaling) -> Result<Arc<DTLSConn>> {

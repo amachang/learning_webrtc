@@ -1,8 +1,10 @@
 // takeaways from this learning
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+use rand::random;
 use anyhow::{Result, ensure, bail};
-use tokio::sync::{mpsc, Notify};
+use bytes::Bytes;
+use tokio::{sync::{mpsc, Notify}, net::UdpSocket, task::{spawn, JoinHandle}, time::{sleep, interval}};
 use webrtc_ice::{
     network_type::NetworkType as IceNetworkType,
     candidate::{
@@ -32,6 +34,7 @@ use webrtc_srtp::{
     protection_profile::ProtectionProfile as SrtpProtectionProfile,
 };
 use webrtc::mux::{self, Mux, mux_func};
+use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use sha2::{Sha256, Digest};
 
 const RECEIVE_MTU: usize = 1460;
@@ -153,5 +156,82 @@ pub async fn start_srtp_sessions(conn: &Mux, dtls_conn: &Arc<DTLSConn>, role: Dt
     let srtcp_session = SrtpSession::new(srtcp_conn, srtcp_config, is_rtp).await?;
 
     Ok((srtp_session, srtcp_session))
+}
+
+pub fn spawn_forward_rtp_task(srtp_session: Arc<SrtpSession>, srtcp_session: Arc<SrtpSession>, ssrcs: Vec<u32>, port: u16) -> JoinHandle<Result<()>> {
+    spawn(async move {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        socket.connect(format!("127.0.0.1:{}", port)).await?;
+
+        let mut tasks = vec![];
+        for ssrc in ssrcs.clone() {
+            {
+                let srtp_session = srtp_session.clone();
+                let socket = socket.clone();
+                let task: JoinHandle<Result<()>> = spawn(async move {
+                    let mut buf = vec![0u8; 1500];
+                    let rtp_stream = srtp_session.open(ssrc).await;
+                    loop {
+                        let n = rtp_stream.read(&mut buf).await?;
+                        match socket.send(&buf[..n]).await {
+                            Ok(_) => (),
+                            Err(e) => log::warn!("failed to forward rtp: {}", e),
+                        }
+                    }
+                });
+                tasks.push(task);
+            };
+            {
+                let srtcp_session = srtcp_session.clone();
+                let socket = socket.clone();
+                let task: JoinHandle<Result<()>> = spawn(async move {
+                    let mut buf = vec![0u8; 1500];
+                    let rtcp_stream = srtcp_session.open(ssrc).await;
+                    loop {
+                        let n = rtcp_stream.read(&mut buf).await?;
+                        match socket.send(&buf[..n]).await {
+                            Ok(_) => (),
+                            Err(e) => log::warn!("failed to forward rtcp: {}", e),
+                        }
+                    }
+                });
+                tasks.push(task);
+            };
+            {
+                let srtcp_session = srtcp_session.clone();
+                let socket = socket.clone();
+                let task: JoinHandle<Result<()>> = spawn(async move {
+                    let mut buf = vec![0u8; 1500];
+                    loop {
+                        let n = match socket.recv(&mut buf).await {
+                            Ok(n) => n,
+                            Err(e) => {
+                                log::warn!("failed to receive rtcp: {}", e);
+                                continue
+                            },
+                        };
+                        let bytes = Bytes::from(buf[..n].to_vec());
+                        srtcp_session.write(&bytes, false).await?;
+                    }
+                });
+                tasks.push(task);
+            };
+            {
+                let srtcp_session = srtcp_session.clone();
+                let task: JoinHandle<Result<()>> = spawn(async move {
+                    sleep(Duration::from_millis(random::<u64>() % 5000)).await;
+                    let mut interval = interval(Duration::from_millis(5000));
+                    loop {
+                        srtcp_session.write_rtcp(&PictureLossIndication { sender_ssrc: 0, media_ssrc: ssrc }).await?;
+                        interval.tick().await;
+                    }
+                });
+                tasks.push(task);
+            };
+        }
+
+        futures::future::try_join_all(tasks).await?;
+        Ok(())
+    })
 }
 
