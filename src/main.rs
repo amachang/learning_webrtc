@@ -1,6 +1,6 @@
 use std::{sync::Arc, path::Path};
 use anyhow::{Context, Result, ensure, bail};
-use tokio::{fs::File, io::AsyncWriteExt, net::UdpSocket};
+use tokio::{fs::File, io::AsyncWriteExt, net::UdpSocket, sync::mpsc};
 use sha2::{Sha256, Digest};
 use webrtc_dtls::{
     crypto::Certificate,
@@ -13,14 +13,13 @@ use webrtc_dtls::{
 };
 use webrtc_srtp::session::Session;
 use webrtc_util::conn::Conn;
-use webrtc::mux::{self, Mux, mux_func};
+use webrtc::mux::{Mux, mux_func};
 use bytes::Bytes;
 
 mod mediasoup_signaling;
 mod mediasoup_data_converter;
 mod util;
 
-const RECEIVE_MTU: usize = 1460;
 const LOCAL_IS_DTLS_CLIENT: bool = true;
 
 use crate::mediasoup_signaling::Signaling;
@@ -32,8 +31,7 @@ async fn main() -> Result<()> {
     let mut signaling = Signaling::new().await?;
     signaling.send_init().await?;
 
-    let conn = connect(&mut signaling).await?;
-    let conn = Mux::new(mux::Config { conn, buffer_size: RECEIVE_MTU });
+    let (conn, _ice_close_tx) = connect(&mut signaling).await?;
 
     log::info!("connected");
 
@@ -123,6 +121,15 @@ async fn main() -> Result<()> {
     let sdp = mediasoup_data_converter::rtp_parameters_to_sdp(video_rtp_parameters, audio_rtp_parameters, video_port, audio_port)?;
     let path = Path::new("video.sdp");
     File::create(path).await?.write_all(sdp.as_bytes()).await?;
+
+    let mut player_task = tokio::process::Command::new("ffplay")
+        .arg("-loglevel").arg("trace")
+        .arg("-analyzeduration").arg("2048M").arg("-probesize").arg("2048M")
+        .arg("-use_wallclock_as_timestamps").arg("1")
+        .arg("-protocol_whitelist").arg("file,udp,rtp").arg("video.sdp")
+        .spawn()?;
+
+/*
     let mut player_task = tokio::process::Command::new("ffmpeg")
         .arg("-y")
         .arg("-loglevel").arg("trace")
@@ -131,6 +138,7 @@ async fn main() -> Result<()> {
         .arg("-protocol_whitelist").arg("file,udp,rtp").arg("-i").arg("video.sdp")
         .arg("-c").arg("copy")
         .arg("output.mkv").spawn()?;
+*/
 
     log::info!("sdp: {}", sdp);
 
@@ -290,14 +298,13 @@ fn fingerprint(cert: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-async fn connect(signaling: &mut Signaling) -> Result<Arc<impl Conn + Send + Sync>> {
+async fn connect(signaling: &mut Signaling) -> Result<(Mux, mpsc::Sender<()>)> {
     let ice_server_urls = vec![];
     let ice_candidates = signaling.ice_candidates().await?;
     let candidates = mediasoup_data_converter::convert_ice_candidates(ice_candidates)?;    
     let ice_parameters = signaling.ice_parameters().await?;
 
-    let (conn, _cancel_tx) = util::connect(ice_server_urls, candidates, ice_parameters.username_fragment, ice_parameters.password).await?;
-    Ok(conn)
+    let (conn, ice_close_tx) = util::connect_ice(ice_server_urls, candidates, ice_parameters.username_fragment, ice_parameters.password).await?;
+    Ok((conn, ice_close_tx))
 }
-
 

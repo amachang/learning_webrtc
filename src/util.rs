@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::{mpsc, Notify};
-use webrtc_util::conn::Conn;
 use webrtc_ice::{
     network_type::NetworkType as IceNetworkType,
     candidate::{
@@ -17,13 +16,16 @@ use webrtc_ice::{
         agent_config::AgentConfig as IceAgentConfig,
     },
 };
+use webrtc::mux::{self, Mux};
 
-pub async fn connect(
+const RECEIVE_MTU: usize = 1460;
+
+pub async fn connect_ice(
     ice_server_urls: Vec<IceServerUrl>,
     ice_candidates: Vec<impl IceCandidate + Send + Sync + 'static>,
     ice_username_fragment: String,
     ice_password: String,
-) -> Result<(Arc<impl Conn + Send + Sync>, mpsc::Sender<()>)> {
+) -> Result<(Mux, mpsc::Sender<()>)> {
 
     // if we have ice_servers, set to config.urls 
     let agent_config = IceAgentConfig {
@@ -58,9 +60,10 @@ pub async fn connect(
 
     notify.notified().await;
 
-    let (cancel_tx, cancel_rx) = mpsc::channel(1);
-    let conn = agent.dial(cancel_rx, ice_username_fragment, ice_password).await?;
+    let (close_tx, close_rx) = mpsc::channel(1);
+    let conn = agent.dial(close_rx, ice_username_fragment, ice_password).await?;
+    let conn = Mux::new(mux::Config { conn, buffer_size: RECEIVE_MTU });
 
-    Ok((conn, cancel_tx))
+    Ok((conn, close_tx))
 }
 
