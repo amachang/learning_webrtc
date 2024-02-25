@@ -251,6 +251,10 @@ async fn main() -> Result<()> {
         i += 1;
     };
 
+    log::info!("waiting player exited");
+
+    player_task.wait().await?;
+
     Ok(())
 }
 
