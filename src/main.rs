@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
     let mut signaling = Signaling::new().await?;
     signaling.send_init().await?;
 
-    let (conn, _ice_close_tx) = connect(&mut signaling).await?;
+    let (conn, ice_close_tx) = connect(&mut signaling).await?;
 
     log::info!("connected");
 
@@ -68,38 +68,19 @@ async fn main() -> Result<()> {
 
     let srtp_session = Arc::new(srtp_session);
     let srtcp_session = Arc::new(srtcp_session);
-    play(signaling, srtp_session, srtcp_session, sdp_path, video_ssrc, rtx_ssrc, audio_ssrc).await?;
 
-    Ok(())
-}
+    let video_forward_task = spawn_forward_rtp_task(srtp_session.clone(), srtcp_session.clone(), vec![video_ssrc, rtx_ssrc], VIDEO_PORT);
+    let audio_forward_task = spawn_forward_rtp_task(srtp_session.clone(), srtcp_session.clone(), vec![audio_ssrc], AUDIO_PORT);
 
-async fn play(mut signaling: Signaling, srtp_session: Arc<Session>, srtcp_session: Arc<Session>, sdp_path: impl AsRef<Path>, video_ssrc: u32, rtx_ssrc: u32, audio_ssrc: u32) -> Result<()> {
-    let sdp_path = sdp_path.as_ref();
-
-    let video_rtp_stream = srtp_session.open(video_ssrc).await;
-    let video_rtcp_stream = srtcp_session.open(video_ssrc).await;
-    let rtx_rtp_stream = srtp_session.open(rtx_ssrc).await;
-    let rtx_rtcp_stream = srtcp_session.open(rtx_ssrc).await;
-    let audio_rtp_stream = srtp_session.open(audio_ssrc).await;
-    let audio_rtcp_stream = srtcp_session.open(audio_ssrc).await;
-
-    let mut buf_audio_rtp = vec![0u8; 1500];
-    let mut buf_audio_rtcp = vec![0u8; 1500];
-    let mut buf_send_audio_rtcp = vec![0u8; 1500];
-
-    let video_socket = UdpSocket::bind("127.0.0.1:0").await?;
-    video_socket.connect(format!("127.0.0.1:{}", VIDEO_PORT)).await?;
-    let audio_socket = UdpSocket::bind("127.0.0.1:0").await?;
-    audio_socket.connect(format!("127.0.0.1:{}", AUDIO_PORT)).await?;
-
+/*
     let mut player_task = tokio::process::Command::new("ffplay")
         .arg("-loglevel").arg("trace")
         .arg("-analyzeduration").arg("2048M").arg("-probesize").arg("2048M")
         .arg("-use_wallclock_as_timestamps").arg("1")
         .arg("-protocol_whitelist").arg("file,udp,rtp").arg(sdp_path)
         .spawn()?;
+*/
 
-/*
     let mut player_task = tokio::process::Command::new("ffmpeg")
         .arg("-y")
         .arg("-loglevel").arg("trace")
@@ -108,114 +89,103 @@ async fn play(mut signaling: Signaling, srtp_session: Arc<Session>, srtcp_sessio
         .arg("-protocol_whitelist").arg("file,udp,rtp").arg("-i").arg(sdp_path)
         .arg("-c").arg("copy")
         .arg("output.mkv").spawn()?;
-*/
 
-    futures::future::try_join_all(vec![
-        video_socket.writable(),
-        audio_socket.writable(),
-    ]).await?;
-
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-    log::info!("sent resume");
-
-    let video_srtcp_session = srtcp_session.clone();
-    let _video_rtp_task: tokio::task::JoinHandle<Result<()>> = tokio::task::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
-        let mut buf_video_rtcp = vec![0u8; 1500];
-        let mut buf_rtx_rtcp = vec![0u8; 1500];
-        let mut buf_send_video_rtcp = vec![0u8; 1500];
-        let mut buf_video_rtp = vec![0u8; 1500];
-        let mut buf_rtx_rtp = vec![0u8; 1500];
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    log::trace!("try to send pli");
-                    video_srtcp_session.write_rtcp(&rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication {
-                        sender_ssrc: 0,
-                        media_ssrc: video_ssrc,
-                    }).await.with_context(|| "failed to send pli")?;
-                },
-                n = video_rtp_stream.read(&mut buf_video_rtp) => {
-                    let n = n.with_context(|| "failed to receive video rtp")?;
-                    log::trace!("video rtp: {}", n);
-                    match video_socket.send(&buf_video_rtp[..n]).await {
-                        Ok(n) => log::trace!("sent video rtp: {}", n),
-                        Err(e) => log::error!("failed to forward video rtp: {}", e),
-                    }
-                },
-                n = rtx_rtp_stream.read(&mut buf_rtx_rtp) => {
-                    let n = n.with_context(|| "failed to receive video rtp")?;
-                    log::trace!("video rtp: {}", n);
-                    match video_socket.send(&buf_rtx_rtp[..n]).await {
-                        Ok(n) => log::trace!("sent video rtp: {}", n),
-                        Err(e) => log::error!("failed to forward video rtp: {}", e),
-                    }
-                },
-                n = video_socket.recv(&mut buf_send_video_rtcp) => {
-                    let n = match n { Ok(n) => { n }, Err(e) => { log::error!("failed to receive local video rtcp: {}", e); continue } };
-                    let bytes = Bytes::from(buf_send_video_rtcp[..n].to_vec());
-                    video_srtcp_session.write(&bytes, false).await.with_context(|| "failed to forward local video rtcp")?;
-                    log::trace!("sent video rtcp: {}", n);
-                },
-                n = video_rtcp_stream.read(&mut buf_video_rtcp) => {
-                    let n = n.with_context(|| "failed to receive video rtcp")?;
-                    log::trace!("video rtcp: {}", n);
-                    match video_socket.send(&buf_video_rtcp[..n]).await { Ok(n) => { log::trace!("sent video rtcp: {}", n) }, Err(e) => { log::error!("failed to forward video rtcp: {}", e) } }
-                },
-                n = rtx_rtcp_stream.read(&mut buf_rtx_rtcp) => {
-                    let n = n.with_context(|| "failed to receive rtx rtcp")?;
-                    log::trace!("rtx rtcp: {}", n);
-                    match video_socket.send(&buf_rtx_rtcp[..n]).await { Ok(n) => { log::trace!("sent rtx rtcp: {}", n) }, Err(e) => { log::error!("failed to forward rtx rtcp: {}", e) } }
-                },
-            };
-        }
-    });
-
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
-    let mut i = 0;
-    loop {
-        log::trace!("loop: {}", i);
-        tokio::select! {
-            _ = signaling.wait_until_closed() => {
-                break;
-            },
-            _ = interval.tick() => {
-                log::trace!("try to send pli");
-                srtcp_session.write_rtcp(&rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication {
-                    sender_ssrc: 0,
-                    media_ssrc: audio_ssrc,
-                }).await.with_context(|| "failed to send pli")?;
-                log::trace!("sent pli");
-            },
-            n = audio_rtp_stream.read(&mut buf_audio_rtp) => {
-                let n = n.with_context(|| "failed to receive audio rtp")?;
-                log::trace!("audio rtp: {}", n);
-                match audio_socket.send(&buf_audio_rtp[..n]).await { Ok(n) => { log::trace!("sent audio rtp: {}", n) }, Err(e) => { log::error!("failed to forward audio rtp: {}", e) } }
-            },
-            n = audio_rtcp_stream.read(&mut buf_audio_rtcp) => {
-                let n = n.with_context(|| "failed to receive audio rtcp")?;
-                log::trace!("audio rtcp: {}", n);
-                match audio_socket.send(&buf_audio_rtcp[..n]).await { Ok(n) => { log::trace!("sent audio rtcp: {}", n) }, Err(e) => { log::error!("failed to forward audio rtcp: {}", e) } }
-            },
-            n = audio_socket.recv(&mut buf_send_audio_rtcp) => {
-                let n = match n { Ok(n) => { n }, Err(e) => { log::error!("failed to receive local audio rtcp: {}", e); continue } };
-                let bytes = Bytes::from(buf_send_audio_rtcp[..n].to_vec());
-                srtcp_session.write(&bytes, false).await.with_context(|| "failed to forward local audio rtcp")?;
-                log::trace!("sent video rtcp: {}", n);
-            },
-            _ = player_task.wait() => {
-                break;
-            },
-        };
-        i += 1;
+    tokio::select! {
+        _ = video_forward_task => {
+            log::info!("video forward task exited");
+        },
+        _ = audio_forward_task => {
+            log::info!("audio forward task exited");
+        },
+        _ = player_task.wait() => {
+            log::info!("player exited");
+        },
+        _ = signaling.wait_until_closed() => {
+            log::info!("signaling closed");
+        },
     };
 
-    log::info!("waiting player exited");
-
-    player_task.wait().await?;
+    let _ = ice_close_tx.send(()).await;
+    let _ = player_task.wait().await;
 
     Ok(())
+}
+
+fn spawn_forward_rtp_task(srtp_session: Arc<Session>, srtcp_session: Arc<Session>, ssrcs: Vec<u32>, port: u16) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::task::spawn(async move {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        socket.connect(format!("127.0.0.1:{}", port)).await?;
+
+        let mut tasks = vec![];
+        for ssrc in ssrcs.clone() {
+            {
+                let srtp_session = srtp_session.clone();
+                let socket = socket.clone();
+                let task: tokio::task::JoinHandle<Result<()>> = tokio::task::spawn(async move {
+                    let mut buf = vec![0u8; 1500];
+                    let rtp_stream = srtp_session.open(ssrc).await;
+                    loop {
+                        let n = rtp_stream.read(&mut buf).await?;
+                        match socket.send(&buf[..n]).await {
+                            Ok(_) => (),
+                            Err(e) => log::warn!("failed to forward rtp: {}", e),
+                        }
+                    }
+                });
+                tasks.push(task);
+            };
+            {
+                let srtcp_session = srtcp_session.clone();
+                let socket = socket.clone();
+                let task: tokio::task::JoinHandle<Result<()>> = tokio::task::spawn(async move {
+                    let mut buf = vec![0u8; 1500];
+                    let rtcp_stream = srtcp_session.open(ssrc).await;
+                    loop {
+                        let n = rtcp_stream.read(&mut buf).await?;
+                        match socket.send(&buf[..n]).await {
+                            Ok(_) => (),
+                            Err(e) => log::warn!("failed to forward rtcp: {}", e),
+                        }
+                    }
+                });
+                tasks.push(task);
+            };
+            {
+                let srtcp_session = srtcp_session.clone();
+                let socket = socket.clone();
+                let task: tokio::task::JoinHandle<Result<()>> = tokio::task::spawn(async move {
+                    let mut buf = vec![0u8; 1500];
+                    loop {
+                        let n = match socket.recv(&mut buf).await {
+                            Ok(n) => n,
+                            Err(e) => {
+                                log::warn!("failed to receive rtcp: {}", e);
+                                continue
+                            },
+                        };
+                        let bytes = Bytes::from(buf[..n].to_vec());
+                        srtcp_session.write(&bytes, false).await?;
+                    }
+                });
+                tasks.push(task);
+            };
+            {
+                let srtcp_session = srtcp_session.clone();
+                let task: tokio::task::JoinHandle<Result<()>> = tokio::task::spawn(async move {
+                    loop {
+                        srtcp_session.write_rtcp(&rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication {
+                            sender_ssrc: 0,
+                            media_ssrc: ssrc,
+                        }).await?;
+                    }
+                });
+                tasks.push(task);
+            };
+        }
+
+        futures::future::try_join_all(tasks).await?;
+        Ok(())
+    })
 }
 
 async fn upgrade_to_dtls(conn: &Mux, signaling: &mut Signaling) -> Result<Arc<DTLSConn>> {
