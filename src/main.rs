@@ -1,12 +1,11 @@
 use std::{sync::Arc, path::Path};
-use anyhow::{Context, Result, ensure, bail};
+use anyhow::{Context, Result, ensure};
 use tokio::{fs::File, io::AsyncWriteExt, net::UdpSocket, sync::mpsc};
 use webrtc_dtls::{
     crypto::Certificate,
     conn::DTLSConn,
 };
-use webrtc_srtp::session::Session;
-use webrtc::mux::{Mux, mux_func};
+use webrtc::mux::Mux;
 use bytes::Bytes;
 
 mod mediasoup_signaling;
@@ -35,42 +34,7 @@ async fn main() -> Result<()> {
 
     log::info!("dtls established");
 
-    let dtls_conn_state = dtls_conn.connection_state().await;
-    let protection_rofile = match dtls_conn.selected_srtpprotection_profile() {
-        webrtc_dtls::extension::extension_use_srtp::SrtpProtectionProfile::Srtp_Aead_Aes_128_Gcm => {
-            webrtc_srtp::protection_profile::ProtectionProfile::AeadAes128Gcm
-        },
-        webrtc_dtls::extension::extension_use_srtp::SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80 => {
-            webrtc_srtp::protection_profile::ProtectionProfile::Aes128CmHmacSha1_80
-        },
-        profile => {
-            bail!("unsupported srtp profile: {:?}", profile);
-        },
-    };
-    log::info!("protection profile: {:?}", protection_rofile);
-    let mut srtp_config = webrtc_srtp::config::Config::default();
-    srtp_config.profile = protection_rofile;
-    srtp_config.extract_session_keys_from_dtls(dtls_conn_state, LOCAL_IS_DTLS_CLIENT).await?;
-    let srtp_conn = conn.new_endpoint(Box::new(mux_func::match_srtp)).await;
-    let srtp_session = Session::new(srtp_conn, srtp_config, true).await?;
-
-    let dtls_conn_state = dtls_conn.connection_state().await;
-    let protection_rofile = match dtls_conn.selected_srtpprotection_profile() {
-        webrtc_dtls::extension::extension_use_srtp::SrtpProtectionProfile::Srtp_Aead_Aes_128_Gcm => {
-            webrtc_srtp::protection_profile::ProtectionProfile::AeadAes128Gcm
-        },
-        webrtc_dtls::extension::extension_use_srtp::SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80 => {
-            webrtc_srtp::protection_profile::ProtectionProfile::Aes128CmHmacSha1_80
-        },
-        profile => {
-            bail!("unsupported srtp profile: {:?}", profile);
-        },
-    };
-    let mut srtcp_config = webrtc_srtp::config::Config::default();
-    srtcp_config.profile = protection_rofile;
-    srtcp_config.extract_session_keys_from_dtls(dtls_conn_state, LOCAL_IS_DTLS_CLIENT).await?;
-    let srtcp_conn = conn.new_endpoint(Box::new(mux_func::match_srtcp)).await;
-    let srtcp_session = Session::new(srtcp_conn, srtcp_config, false).await?;
+    let (srtp_session, srtcp_session) = util::start_srtp_sessions(&conn, &dtls_conn, DTLS_ROLE).await?;
 
     log::info!("srtp established");
 

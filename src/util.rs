@@ -1,7 +1,7 @@
 // takeaways from this learning
 
 use std::sync::Arc;
-use anyhow::{Result, ensure};
+use anyhow::{Result, ensure, bail};
 use tokio::sync::{mpsc, Notify};
 use webrtc_ice::{
     network_type::NetworkType as IceNetworkType,
@@ -25,6 +25,11 @@ use webrtc_dtls::{
     },
     crypto::Certificate as DtlsCertificate,
     extension::extension_use_srtp::SrtpProtectionProfile as DtlsSrtpProtectionProfile,
+};
+use webrtc_srtp::{
+    config::Config as SrtpConfig,
+    session::Session as SrtpSession,
+    protection_profile::ProtectionProfile as SrtpProtectionProfile,
 };
 use webrtc::mux::{self, Mux, mux_func};
 use sha2::{Sha256, Digest};
@@ -121,5 +126,32 @@ pub fn get_cert_fingerprint(cert: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(cert);
     hasher.finalize().into()
+}
+
+pub async fn start_srtp_sessions(conn: &Mux, dtls_conn: &Arc<DTLSConn>, role: DtlsRole) -> Result<(SrtpSession, SrtpSession)> {
+    async fn create_srtp_config(dtls_conn: &Arc<DTLSConn>, role: DtlsRole)  -> Result<SrtpConfig> {
+        let is_client = match role { DtlsRole::Client => true };
+        let dtls_conn_state = dtls_conn.connection_state().await;
+        let protection_rofile = match dtls_conn.selected_srtpprotection_profile() {
+            DtlsSrtpProtectionProfile::Srtp_Aead_Aes_128_Gcm => SrtpProtectionProfile::AeadAes128Gcm,
+            DtlsSrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80 => SrtpProtectionProfile::Aes128CmHmacSha1_80,
+            profile => bail!("unsupported srtp profile: {:?}", profile),
+        };
+        let mut srtp_config = SrtpConfig { profile: protection_rofile, ..Default::default() };
+        srtp_config.extract_session_keys_from_dtls(dtls_conn_state, is_client).await?;
+        Ok(srtp_config)
+    }
+
+    let is_rtp = true;
+    let srtp_config = create_srtp_config(dtls_conn, role).await?;
+    let srtp_conn = conn.new_endpoint(Box::new(mux_func::match_srtp)).await;
+    let srtp_session = SrtpSession::new(srtp_conn, srtp_config, is_rtp).await?;
+
+    let is_rtp = false;
+    let srtcp_config = create_srtp_config(dtls_conn, role).await?;
+    let srtcp_conn = conn.new_endpoint(Box::new(mux_func::match_srtcp)).await;
+    let srtcp_session = SrtpSession::new(srtcp_conn, srtcp_config, is_rtp).await?;
+
+    Ok((srtp_session, srtcp_session))
 }
 
