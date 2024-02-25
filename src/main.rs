@@ -1,15 +1,7 @@
 use std::{sync::Arc, path::Path};
 use anyhow::{Context, Result, ensure, bail};
-use tokio::{sync::{mpsc, Notify}, fs::File, io::AsyncWriteExt, net::UdpSocket};
+use tokio::{fs::File, io::AsyncWriteExt, net::UdpSocket};
 use sha2::{Sha256, Digest};
-use webrtc_ice::{
-    network_type::NetworkType,
-    agent::{
-        Agent,
-        agent_config::AgentConfig,
-    },
-    candidate::Candidate,
-};
 use webrtc_dtls::{
     crypto::Certificate,
     config::{
@@ -26,6 +18,7 @@ use bytes::Bytes;
 
 mod mediasoup_signaling;
 mod mediasoup_data_converter;
+mod util;
 
 const RECEIVE_MTU: usize = 1460;
 const LOCAL_IS_DTLS_CLIENT: bool = true;
@@ -298,45 +291,12 @@ fn fingerprint(cert: &[u8]) -> [u8; 32] {
 }
 
 async fn connect(signaling: &mut Signaling) -> Result<Arc<impl Conn + Send + Sync>> {
-    // if we have ice_servers, set to config.urls 
-    let agent_config = AgentConfig {
-        network_types: vec![NetworkType::Udp4, NetworkType::Udp6],
-        ..Default::default()
-    };
-    let agent = Agent::new(agent_config).await?;
-    let notify = Arc::new(Notify::new());
-
+    let ice_server_urls = vec![];
     let ice_candidates = signaling.ice_candidates().await?;
-    log::info!("ice candidates: {:?}", ice_candidates);
     let candidates = mediasoup_data_converter::convert_ice_candidates(ice_candidates)?;    
-    for candidate in candidates {
-        let candidate = Arc::new(candidate);
-        log::info!("add remote candidate: {}", candidate);
-        agent.add_remote_candidate(&(candidate as Arc<dyn Candidate + Send + Sync>))?;
-    }
-    agent.on_connection_state_change(Box::new(move |s| {
-        log::info!("connection state changed: {}", s);
-        Box::pin(async { })
-    }));
-
-    let notify_on_candidate = notify.clone();
-    agent.on_candidate(Box::new(move |c| {
-        if let Some(c) = c {
-            log::info!("candidate: {}", c);
-        } else {
-            log::info!("candidate gathering done");
-            notify_on_candidate.notify_one();
-        };
-        Box::pin(async { })
-    }));
-    agent.gather_candidates()?;
-
-    notify.notified().await;
-
-    let (_cancel_tx, cancel_rx) = mpsc::channel(1);
     let ice_parameters = signaling.ice_parameters().await?;
-    let conn = agent.dial(cancel_rx, ice_parameters.username_fragment, ice_parameters.password).await?;
 
+    let (conn, _cancel_tx) = util::connect(ice_server_urls, candidates, ice_parameters.username_fragment, ice_parameters.password).await?;
     Ok(conn)
 }
 
