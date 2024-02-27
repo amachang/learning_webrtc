@@ -37,7 +37,7 @@ use webrtc::mux::{self, Mux, mux_func};
 use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use sha2::{Sha256, Digest};
 
-const RECEIVE_MTU: usize = 1460;
+const RECEIVE_MTU: usize = 1220;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DtlsRole {
@@ -234,4 +234,6 @@ pub fn spawn_forward_rtp_task(srtp_session: Arc<SrtpSession>, srtcp_session: Arc
         Ok(())
     })
 }
+
+
 
